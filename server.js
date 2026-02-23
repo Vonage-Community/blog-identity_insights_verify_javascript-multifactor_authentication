@@ -1,32 +1,51 @@
 require("dotenv").config();
-const axios = require("axios");
 const express = require("express");
 const path = require("path");
-const { Auth } = require("@vonage/auth");
 const { Vonage } = require("@vonage/server-sdk");
+const { Auth } = require("@vonage/auth");
 const { Channels } = require("@vonage/verify2");
+const { IdentityInsights } = require("@vonage/identity-insights");
+const fs = require("fs");
 
 const app = express();
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "public")));
 
+const APPLICATION_ID = process.env.VONAGE_APPLICATION_ID;
+const PRIVATE_KEY = process.env.VONAGE_PRIVATE_KEY;
+const PERIOD = process.env.PERIOD;
+
+// Bootstrap Step
+if (!APPLICATION_ID || !PRIVATE_KEY) {
+  console.error("VONAGE_APPLICATION_ID or VONAGE_PRIVATE_KEY not set");
+  process.exit(1);
+}
+
+const keyContent = fs.existsSync(PRIVATE_KEY)
+  ? fs.readFileSync(PRIVATE_KEY, "utf8")
+  : PRIVATE_KEY;
+
+if (!keyContent) {
+  console.error(
+    "INVALID private key. Check if the file exists or the environment variable is correctly set"
+  );
+  process.exit(1);
+}
+
 const vonage = new Vonage(
   new Auth({
-    apiKey: process.env.VONAGE_API_KEY,
-    apiSecret: process.env.VONAGE_API_SECRET,
-    applicationId: process.env.VONAGE_APPLICATION_ID,
-    privateKey: process.env.VONAGE_PRIVATE_KEY,
+    applicationId: APPLICATION_ID,
+    privateKey: keyContent,
   })
 );
 
-const scope = "dpv:FraudPreventionAndDetection#check-sim-swap";
-const authReqUrl = "https://api-eu.vonage.com/oauth2/bc-authorize";
-const tokenUrl = "https://api-eu.vonage.com/oauth2/token";
-const simSwapApiUrl = "https://api-eu.vonage.com/camara/sim-swap/v040/check";
+const identityClient = new IdentityInsights({
+  applicationId: APPLICATION_ID,
+  privateKey: keyContent,
+});
 
 let phoneNumber = null;
 let verifyRequestId = null;
-let pwd = "123"; // Initial password
 
 // In-memory store for user data
 const users = {
@@ -46,84 +65,35 @@ app.get("/main", (req, res) => {
   res.sendFile(path.join(__dirname, "views/main.html"));
 });
 
-// Authenticate function for SIM Swap API
-async function authenticate(phone, scope) {
-  try {
-    const authReqResponse = await axios.post(
-      authReqUrl,
-      {
-        login_hint: phone,
-        scope: scope,
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.JWT}`,
-          "Content-Type": "application/x-www-form-urlencoded",
-        },
-      }
-    );
-    const authReqId = authReqResponse.data.auth_req_id;
-
-    const tokenResponse = await axios.post(
-      tokenUrl,
-      {
-        auth_req_id: authReqId,
-        grant_type: "urn:openid:params:grant-type:ciba",
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.JWT}`,
-          "Content-Type": "application/x-www-form-urlencoded",
-        },
-      }
-    );
-    return tokenResponse.data.access_token;
-  } catch (error) {
-    console.error(
-      "Error during authentication:",
-      error.response?.data || error.message
-    );
-    throw error;
-  }
-}
-
 // Check if the phone number has been recently swapped
 async function checkSim() {
   try {
-    const accessToken = await authenticate(phoneNumber, scope);
-    const response = await axios.post(
-      simSwapApiUrl,
-      {
-        phoneNumber: phoneNumber,
-        maxAge: process.env.MAX_AGE,
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          "Content-Type": "application/json",
+    const resp = await identityClient.getIdentityInsights({
+      phoneNumber: phoneNumber,
+      purpose: "FraudPreventionAndDetection",
+      insights: {
+        simSwap: {
+          period: parseInt(PERIOD),
         },
-      }
-    );
-    return response.data.swapped;
+      },
+    });
+
+    return resp.insights?.simSwap?.isSwapped === true;
   } catch (error) {
-    console.error(
-      "Error checking SIM swap:",
-      error.response?.data || error.message
-    );
-    throw error;
+    console.warn("Identity Insights SDK call failed:", error && error.message);
   }
 }
 
 // Route to send a verification code via Verify2 API using Channels
 app.post("/sendcode", async (req, res) => {
   const phone = process.env.RECIPIENT_NUMBER ? process.env.RECIPIENT_NUMBER : req.body.phone;
- 
+
   try {
     const response = await vonage.verify2.newRequest({
-     brand: "Vonage Bank",
+      brand: "Vonage Bank",
       workflow: [
         {
-          channel: Channels.SMS, // Using SMS as the channel
+          channel: Channels.SMS,
           to: phone,
         },
       ],
@@ -161,7 +131,6 @@ app.post("/verify", (req, res) => {
     .checkCode(verifyRequestId, pin)
     .then((status) => {
       if (status === "completed") {
-        // Update the password in the in-memory store
         const user = Object.values(users).find(user => user.username === "user1");
         if (user) {
           user.password = newPass;
@@ -183,7 +152,7 @@ app.post("/verify", (req, res) => {
 // Update password
 app.post("/update", (req, res) => {
   const { newPass } = req.body;
-  const user = Object.values(users).find(user => user.username === "user1"); // assuming user1
+  const user = Object.values(users).find(user => user.username === "user1");
   if (user) {
     user.password = newPass;
     res.json({ message: "Success" });
